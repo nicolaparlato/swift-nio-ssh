@@ -582,6 +582,95 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         }
     }
 
+    /// A server hardened to offer only encrypt-then-MAC algorithms shares no MAC name with us,
+    /// and must still be able to talk to us over AES-GCM, which needs no MAC at all.
+    ///
+    /// This is not a hypothetical. The names a hardened OpenSSH offers — `hmac-sha2-256-etm@
+    /// openssh.com` and its siblings — are different strings from the plain ones rather than
+    /// variants of them, so the intersection with our list is empty. Before the fix the handshake
+    /// was refused there, over a cipher both sides were perfectly happy with, and the error said
+    /// only that negotiation had failed.
+    func testAServerOfferingOnlyETMMACsStillNegotiatesAESGCM() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+
+        var client = SSHKeyExchangeStateMachine(
+            allocator: allocator,
+            loop: loop,
+            role: .client(.init(userAuthDelegate: ExplodingAuthDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())),
+            remoteVersion: Constants.version,
+            keyExchangeAlgorithms: SSHKeyExchangeStateMachine.bundledKeyExchangeImplementations,
+            transportProtectionSchemes: [AES256GCMOpenSSHTransportProtection.self],
+            previousSessionIdentifier: nil
+        )
+        var server = SSHKeyExchangeStateMachine(
+            allocator: allocator,
+            loop: loop,
+            role: .server(.init(hostKeys: [.init(ed25519Key: .init())], userAuthDelegate: DenyAllServerAuthDelegate())),
+            remoteVersion: Constants.version,
+            keyExchangeAlgorithms: SSHKeyExchangeStateMachine.bundledKeyExchangeImplementations,
+            transportProtectionSchemes: [AES256GCMOpenSSHTransportProtection.self],
+            previousSessionIdentifier: nil
+        )
+
+        var serverMessage = server.createKeyExchangeMessage()
+        let clientMessage = client.createKeyExchangeMessage()
+
+        // What such a server actually puts on the wire: the plain names are gone entirely.
+        let etm: [Substring] = [
+            "umac-128-etm@openssh.com", "hmac-sha2-256-etm@openssh.com", "hmac-sha2-512-etm@openssh.com",
+        ]
+        serverMessage.macAlgorithmsClientToServer = etm
+        serverMessage.macAlgorithmsServerToClient = etm
+
+        server.send(keyExchange: serverMessage)
+        client.send(keyExchange: clientMessage)
+
+        XCTAssertNoThrow(try client.handle(keyExchange: serverMessage))
+    }
+
+    /// The other half of the same rule: a cipher that really does consume a MAC still requires one.
+    ///
+    /// This package ships only AEAD schemes, so the case needs a stand-in. Citadel contributes a
+    /// real one (AES128-CTR), which is where the original failure came from — its MAC names are
+    /// what made our advertised list non-empty and the miss look fatal.
+    func testACipherThatConsumesAMACStillRequiresOne() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+
+        var client = SSHKeyExchangeStateMachine(
+            allocator: allocator,
+            loop: loop,
+            role: .client(.init(userAuthDelegate: ExplodingAuthDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())),
+            remoteVersion: Constants.version,
+            keyExchangeAlgorithms: SSHKeyExchangeStateMachine.bundledKeyExchangeImplementations,
+            transportProtectionSchemes: [MACConsumingTransportProtection.self],
+            previousSessionIdentifier: nil
+        )
+        var server = SSHKeyExchangeStateMachine(
+            allocator: allocator,
+            loop: loop,
+            role: .server(.init(hostKeys: [.init(ed25519Key: .init())], userAuthDelegate: DenyAllServerAuthDelegate())),
+            remoteVersion: Constants.version,
+            keyExchangeAlgorithms: SSHKeyExchangeStateMachine.bundledKeyExchangeImplementations,
+            transportProtectionSchemes: [MACConsumingTransportProtection.self],
+            previousSessionIdentifier: nil
+        )
+
+        var serverMessage = server.createKeyExchangeMessage()
+        let clientMessage = client.createKeyExchangeMessage()
+        let etm: [Substring] = ["hmac-sha2-256-etm@openssh.com"]
+        serverMessage.macAlgorithmsClientToServer = etm
+        serverMessage.macAlgorithmsServerToClient = etm
+
+        server.send(keyExchange: serverMessage)
+        client.send(keyExchange: clientMessage)
+
+        XCTAssertThrowsError(try client.handle(keyExchange: serverMessage)) { error in
+            XCTAssertEqual((error as? NIOSSHError)?.type, .keyExchangeNegotiationFailure)
+        }
+    }
+
     func testWeNegotiateTheClientsFirstPreference() throws {
         // Happy path key exchange test, but where the client would prefer AES128 and the server would prefer AES256.
         // We expect AES128, but the negotiation should be smooth.
@@ -1067,5 +1156,21 @@ private extension SSHKeyExchangeStateMachineTests {
                 preconditionFailure("Unexpected message for testing: \(message)")
             }
         }
+    }
+}
+
+
+/// A transport protection scheme that names a MAC, which nothing in this package otherwise does.
+///
+/// Every scheme NIOSSH bundles is AEAD and declares no MAC, so without this the rule "a cipher
+/// that consumes a MAC still requires one" could not be tested here at all — and that is the half
+/// of the rule where getting it wrong would weaken the handshake rather than merely break it.
+final class MACConsumingTransportProtection: AESGCMTransportProtection {
+    override static var cipherName: String { "aes256-ctr" }
+
+    override static var macNames: [String] { ["hmac-sha2-256"] }
+
+    override class func keySizes(forMac mac: String?) throws -> ExpectedKeySizes {
+        .init(ivSize: 12, encryptionKeySize: 32, macKeySize: 32)
     }
 }

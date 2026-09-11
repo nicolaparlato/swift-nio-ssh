@@ -370,7 +370,13 @@ struct SSHKeyExchangeStateMachine {
         }
 
         // Ok, now we need to find the right transport protection scheme. This can technically fail.
-        guard let scheme = self.transportProtectionSchemes.first(where: { $0.cipherName == clientEncryption && ($0.macNames.isEmpty || $0.macNames.contains(String(clientMAC))) }) else {
+        guard let scheme = self.transportProtectionSchemes.first(where: { scheme in
+            guard scheme.cipherName == clientEncryption else { return false }
+            // A scheme that names no MAC accepts whatever was negotiated, including nothing.
+            if scheme.macNames.isEmpty { return true }
+            guard let clientMAC else { return false }
+            return scheme.macNames.contains(String(clientMAC))
+        }) else {
             throw NIOSSHError.keyExchangeNegotiationFailure
         }
 
@@ -444,7 +450,7 @@ struct SSHKeyExchangeStateMachine {
         throw NIOSSHError.keyExchangeNegotiationFailure
     }
 
-    private func negotiatedTransportProtection(peerEncryptionAlgorithms: [Substring], peerMacAlgorithms: [Substring]) throws -> (encryption: Substring, mac: Substring) {
+    private func negotiatedTransportProtection(peerEncryptionAlgorithms: [Substring], peerMacAlgorithms: [Substring]) throws -> (encryption: Substring, mac: Substring?) {
         // Ok, rephrase as client and server instead of us and them.
         let clientEncryptionAlgorithms: [Substring]
         let serverEncryptionAlgorithms: [Substring]
@@ -471,11 +477,31 @@ struct SSHKeyExchangeStateMachine {
         }
 
         // Ok great, now work out what we negotiated as a MAC.
-        guard let mac = clientMACAlgorithms.first(where: { serverMACAlgorithms.contains($0) }) else {
-            throw NIOSSHError.keyExchangeNegotiationFailure
+        if let mac = clientMACAlgorithms.first(where: { serverMACAlgorithms.contains($0) }) {
+            return (encryption, mac)
         }
 
-        return (encryption, mac)
+        // No overlap. That is only fatal if the cipher we just agreed on actually consumes a MAC.
+        //
+        // AES-GCM in OpenSSH mode authenticates every packet by construction and declares no MAC
+        // name at all: AES256GCMOpenSSHTransportProtection says in its own documentation that it
+        // works "by ignoring the result of the MAC negotiation", and its keySizes(forMac:) throws
+        // the argument away. OpenSSH does the same - for aes*-gcm@openssh.com the MAC lists are
+        // not consulted. Everything downstream of here already carries the MAC as an Optional for
+        // exactly this reason.
+        //
+        // Requiring an overlap regardless is how a working AES-GCM connection was refused. A
+        // server hardened to offer only the encrypt-then-MAC names - hmac-sha2-256-etm@openssh.com
+        // and its siblings, which are different strings from the plain ones rather than variants
+        // of them - shares no MAC name with us, and the handshake failed over a cipher both sides
+        // were perfectly happy with, with nothing anyone could point at.
+        let consumesMAC = self.transportProtectionSchemes
+            .filter { $0.cipherName == encryption }
+            .allSatisfy { !$0.macNames.isEmpty }
+        guard !consumesMAC else {
+            throw NIOSSHError.keyExchangeNegotiationFailure
+        }
+        return (encryption, nil)
     }
 
     private mutating func addKeyExchangeInitMessagesToExchangeBytes(clientsMessage: SSHMessage.KeyExchangeMessage, serversMessage: SSHMessage.KeyExchangeMessage) {
