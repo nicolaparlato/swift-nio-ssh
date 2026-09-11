@@ -92,6 +92,12 @@ final class SSHPacketParserTests: XCTestCase {
         }
     }
 
+    /// The lines before the version are skipped, not prepended to it.
+    ///
+    /// This test used to assert the opposite, and the assertion was the bug: what it returns
+    /// becomes V_S in the exchange hash, so carrying the banner along made the hash disagree
+    /// with the server's and the host key signature fail to verify. RFC 4253 4.2 permits those
+    /// lines; 8 defines V_S as the identification string alone.
     func testReadVersionWithExtraLinesWithoutCarriageReturn() throws {
         var parser = SSHPacketParser(allocator: ByteBufferAllocator())
 
@@ -105,10 +111,29 @@ final class SSHPacketParserTests: XCTestCase {
 
         switch try parser.nextPacket() {
         case .version(let string):
-            XCTAssertEqual(string, "xxxx\nyyyy\nSSH-2.0-OpenSSH_7.4")
+            XCTAssertEqual(string, "SSH-2.0-OpenSSH_7.4")
         default:
             XCTFail("Expecting .version")
         }
+    }
+
+    /// A banner ending in CRLF, which is what a real device sends, and the reader index must
+    /// still land past all of it so the KEXINIT behind it parses.
+    func testABannerBeforeTheVersionIsConsumedButNotReturned() throws {
+        var parser = SSHPacketParser(allocator: ByteBufferAllocator())
+
+        var part = ByteBuffer.of(string: "Unauthorised access prohibited.\r\n\r\nSSH-2.0-Switch_1.0\r\n")
+        parser.append(bytes: &part)
+
+        switch try parser.nextPacket() {
+        case .version(let string):
+            XCTAssertEqual(string, "SSH-2.0-Switch_1.0")
+        default:
+            XCTFail("Expecting .version")
+        }
+
+        // Nothing of the banner is left behind for the binary parser to choke on.
+        XCTAssertNil(try parser.nextPacket())
     }
 
     func testBinaryInParts() throws {

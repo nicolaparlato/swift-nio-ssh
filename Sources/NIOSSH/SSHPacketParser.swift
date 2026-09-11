@@ -151,8 +151,14 @@ struct SSHPacketParser {
                 
                 // Check if this line looks like an SSH version (any SSH version, not just 2.0)
                 if lineSlice.count >= 4 && lineSlice.starts(with: "SSH-".utf8) {
-                    // Found SSH version line, return everything up to and including this line
-                    var version = String(decoding: slice[slice.startIndex..<index], as: UTF8.self)
+                    // The identification string is this line alone. RFC 4253 4.2 lets a server
+                    // send other lines first and forbids them from beginning "SSH-", and 8 puts
+                    // V_S - "the server's identification string" - into the exchange hash. So the
+                    // preamble is consumed from the buffer but must not be returned with it:
+                    // handing back the banner too made V_S wrong, the hash wrong, and the host
+                    // key's signature over it unverifiable. Any server that prints a legal notice
+                    // before its version - which plenty of switches do - was unreachable.
+                    var version = String(decoding: lineSlice, as: UTF8.self)
                     // read including \n
                     self.buffer.moveReaderIndex(forwardBy: slice.startIndex.distance(to: index).advanced(by: 1))
                     // Remove the trailing \r if present (but keep \n removal logic for consistency)
