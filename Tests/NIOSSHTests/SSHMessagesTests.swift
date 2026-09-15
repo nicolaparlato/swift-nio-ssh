@@ -131,6 +131,47 @@ final class SSHMessagesTests: XCTestCase {
         try self.assertCorrectlyManagesPartialRead(message)
     }
 
+    /// A KEXINIT whose name-lists end in a comma must write back byte for byte.
+    ///
+    /// The peer's message is re-serialised from this parsed form to become I_S in the
+    /// exchange hash, so any byte the parse loses makes the hash disagree with the
+    /// server's and the host key signature fail to verify. A real device sends its MAC
+    /// lists as "umac-128-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,"
+    /// and was unreachable for exactly that reason.
+    func testKeyExchangeMessageWithTrailingCommaRoundTrips() throws {
+        var original = ByteBufferAllocator().buffer(capacity: 256)
+        original.writeInteger(SSHMessage.KeyExchangeMessage.id)
+        original.writeBytes([UInt8](repeating: 7, count: 16))
+        original.writeSSHString("curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256".utf8)
+        original.writeSSHString("ssh-ed25519".utf8)
+        original.writeSSHString("aes128-ctr,aes128-gcm@openssh.com".utf8)
+        original.writeSSHString("aes128-ctr,aes128-gcm@openssh.com".utf8)
+        original.writeSSHString("umac-128-etm@openssh.com,hmac-sha2-256-etm@openssh.com,".utf8)
+        original.writeSSHString("umac-128-etm@openssh.com,hmac-sha2-256-etm@openssh.com,".utf8)
+        original.writeSSHString("none,zlib@openssh.com".utf8)
+        original.writeSSHString("none,zlib@openssh.com".utf8)
+        original.writeSSHString("".utf8)
+        original.writeSSHString("".utf8)
+        original.writeSSHBoolean(false)
+        original.writeInteger(0 as UInt32)
+
+        var buffer = original
+        guard case .some(.keyExchange(let message)) = try buffer.readSSHMessage() else {
+            XCTFail("Expected a KEXINIT")
+            return
+        }
+        XCTAssertEqual(buffer.readableBytes, 0)
+
+        // The real names are still there for negotiation, the empty one alongside them.
+        XCTAssertTrue(message.macAlgorithmsClientToServer.contains("hmac-sha2-256-etm@openssh.com"))
+        XCTAssertEqual(message.macAlgorithmsClientToServer.last, "")
+        XCTAssertEqual(message.languagesClientToServer, [])
+
+        var rewritten = ByteBufferAllocator().buffer(capacity: 256)
+        rewritten.writeSSHMessage(.keyExchange(message))
+        XCTAssertEqual(Array(rewritten.readableBytesView), Array(original.readableBytesView))
+    }
+
     func testKeyExchangeInit() throws {
         var buffer = ByteBufferAllocator().buffer(capacity: 100)
         let message = SSHMessage.keyExchangeInit(.init(publicKey: ByteBuffer.of(bytes: [42])))

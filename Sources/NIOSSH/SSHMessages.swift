@@ -649,7 +649,17 @@ extension ByteBuffer {
             guard let string = self.readSSHStringAsString() else {
                 return nil
             }
-            return string.split(separator: ",")
+            // Empty entries are kept. The peer's KEXINIT goes into the exchange hash as I_S
+            // (RFC 4253 8), and it gets there by being written back from this parsed form,
+            // so the parse has to be lossless: a list that arrives as "a,b," must leave as
+            // "a,b,". Dropping the empty entry - which is what split() does by default -
+            // made the hash disagree with the server's and its host key signature fail to
+            // verify, against a device whose MAC lists end in a comma. An empty name never
+            // matches anything in negotiation, so keeping it costs nothing there.
+            guard !string.isEmpty else {
+                return []
+            }
+            return string.split(separator: ",", omittingEmptySubsequences: false)
         }
     }
 
